@@ -20,9 +20,11 @@ How has streamflow in south-west WA catchments changed since 1975, and which cat
 Exceptions:
 - 613002 Dingo Rd accepted at 89% Quality A because it is an HRS station
 - Basin 602 excluded: no candidate station was an HRS station
+- 613007 Waterous ranked highest in basin 613 but is not an HRS station, so 613002 Dingo Rd was used instead
+- HRS status was checked manually at bom.gov.au/water/hrs, so the final list differs from the notebook's automated shortlist
 
 Final stations: see `config/stations.csv` (9 stations).
 
 ## Notes
-- Timestamps are returned in UTC; converted to Australia/Perth before daily aggregation
-- HRS uses a March to February water year; annual analysis will follow this
+- Timestamps are returned in UTC (16:00 UTC = 00:00 AWST) and converted to Australia/Perth. The `DailyMean` series is already daily, so no aggregation is needed.
+- Annual analysis will use the HRS water year, which BoM defines per station as starting in the month with the lowest average monthly flow. Water-year start months will be recorded per station in `config/stations.csv`.

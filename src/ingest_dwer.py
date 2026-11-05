@@ -16,26 +16,21 @@ Keep the data itself out of the public repo (data/ is gitignored); only this cod
 """
 
 import argparse
-import csv
 import json
 import logging
 import os
 import sys
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 
 import boto3
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from common import CONFIG_PATH, load_stations, make_session, setup_logging, write_output
 
 LAYER_URL = (
     "https://public-services.slip.wa.gov.au/public/rest/services/"
     "SLIP_Public_Services/Water/MapServer/61"
 )
 QUERY_URL = f"{LAYER_URL}/query"
-# Copy the same User-Agent string you use in ingest_bom.py (with your real email).
-USER_AGENT = "wa-streamflow-pipeline (portfolio project; chaoyue0224@gmail.com)"
 
 # Only the fields relevant to stream gauges. The ~15 groundwater-only fields are always "N/A".
 OUT_FIELDS = [
@@ -62,41 +57,7 @@ OUT_FIELDS = [
     "pub_url",
 ]
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "config" / "stations.csv"
-LOCAL_OUT = PROJECT_ROOT / "data"  # dry-run output; data/ is gitignored
-
 log = logging.getLogger("ingest_dwer")
-
-
-def load_station_ids(path, only=None):
-    """Read station numbers from the config. Optionally keep only those in `only`."""
-    with open(path, newline="", encoding="utf-8") as f:
-        ids = [row["station_no"].strip() for row in csv.DictReader(f)]
-    if only:
-        wanted = set(only)
-        missing = wanted - set(ids)
-        if missing:
-            raise SystemExit(f"Station(s) not in config: {sorted(missing)}")
-        ids = [i for i in ids if i in wanted]
-    return ids
-
-
-def make_session():
-    """HTTP session that retries transient failures with exponential backoff."""
-    retry = Retry(
-        total=5,
-        backoff_factor=2,  # waits roughly 2, 4, 8, 16 seconds between attempts
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
 
 
 def build_params(station_ids):
@@ -162,19 +123,6 @@ def s3_key(ingest_date):
     return f"bronze/dwer/sites/ingest_date={ingest_date.isoformat()}/sites.json"
 
 
-def write_output(envelope, key, bucket, dry_run):
-    body = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
-    if dry_run:
-        out_path = LOCAL_OUT / key
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(body)
-        return str(out_path)
-    boto3.client("s3").put_object(
-        Bucket=bucket, Key=key, Body=body, ContentType="application/json"
-    )
-    return f"s3://{bucket}/{key}"
-
-
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--stations", nargs="+", help="Only these station numbers (default: all in config)")
@@ -184,12 +132,12 @@ def parse_args():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    setup_logging()
     args = parse_args()
     if not args.dry_run and not args.bucket:
         raise SystemExit("No bucket given. Use --bucket, set S3_BUCKET, or add --dry-run.")
 
-    station_ids = load_station_ids(CONFIG_PATH, args.stations)
+    station_ids = [s["station_no"] for s in load_stations(CONFIG_PATH, args.stations)]
     log.info("Requesting DWER metadata for %d station(s): %s", len(station_ids), ", ".join(station_ids))
 
     session = make_session()
@@ -208,8 +156,10 @@ def main():
 
     ingested_at = datetime.now(timezone.utc)
     envelope = build_envelope(station_ids, params, payload, ingested_at)
-    key = s3_key(date.today())
-    location = write_output(envelope, key, args.bucket, args.dry_run)
+    key = s3_key(ingested_at.date())
+    body = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    s3 = None if args.dry_run else boto3.client("s3")
+    location = write_output(body, key, args.bucket, s3)
     log.info("Wrote %d feature(s) to %s", envelope["feature_count"], location)
 
 

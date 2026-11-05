@@ -1,70 +1,61 @@
-"""Ingest BoM daily discharge (KiWIS) for configured stations into the S3 bronze layer.
+"""Ingest BoM daily discharge (KiWIS) for configured stations into the S3 bronze layer, incrementally.
 
 Usage examples (run from the project root):
-    python src/ingest_bom.py --dry-run --stations 613002   # test one station locally
-    python src/ingest_bom.py --dry-run                     # all stations, local only
-    python src/ingest_bom.py --bucket chaoyue-wa-streamflow  # all stations to S3
+    python src/ingest_bom.py --bucket chaoyue-wa-streamflow                  # incremental, all stations
+    python src/ingest_bom.py --dry-run --bucket chaoyue-wa-streamflow        # read state from S3, write locally
+    python src/ingest_bom.py --dry-run --stations 613002                     # local state and output only
+    python src/ingest_bom.py --bucket chaoyue-wa-streamflow --full-refresh   # reload everything from 1975
+    python src/ingest_bom.py --bucket chaoyue-wa-streamflow --from 2020-01-01 --stations 613002
+
+How the incremental window is chosen (per station):
+    1. --from given        -> use it (manual backfill).
+    2. --full-refresh      -> DEFAULT_FROM.
+    3. Otherwise           -> watermark = latest day WITH A VALUE already in bronze,
+                              then go back LOOKBACK_DAYS to pick up late corrections.
+                              No bronze data yet -> DEFAULT_FROM (first load).
+
+Days with no data come back as rows with a null value, so the watermark ignores them;
+otherwise days BoM fills in later would never be fetched.
+
+The overlap means the same day can appear in several bronze files. That is intended:
+bronze is append-only, and dbt staging keeps the row from the latest ingested_at.
 
 The raw KiWIS response is stored unmodified inside a small metadata envelope.
-Cleaning, flattening and type casting happen later in dbt (staging layer).
 """
 
 import argparse
-import csv
 import json
 import logging
 import os
+import re
 import sys
-from datetime import date, datetime, timezone
-from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import boto3
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from common import (
+    CONFIG_PATH,
+    list_objects,
+    load_stations,
+    make_session,
+    read_json,
+    setup_logging,
+    write_output,
+)
 
 BASE_URL = "http://www.bom.gov.au/waterdata/services"
-USER_AGENT = "wa-streamflow-pipeline (portfolio project; chaoyue0224@gmail.com)"
 TS_NAME = "DMQaQc.Merged.DailyMean.24HR"
 RETURN_FIELDS = "Timestamp,Value,Quality Code"
 DEFAULT_FROM = "1975-01-01"
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "config" / "stations.csv"
-LOCAL_OUT = PROJECT_ROOT / "data"  # dry-run output; data/ is gitignored
+LOOKBACK_DAYS = 7          # re-fetch this many days before the watermark
+MAX_FILES_TO_SCAN = 10     # stop looking for a watermark after this many files
+LOCAL_TZ = ZoneInfo("Australia/Perth")
 
 log = logging.getLogger("ingest_bom")
 
 
-def load_stations(path, only=None):
-    """Read the station config. Optionally keep only the station numbers in `only`."""
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    if only:
-        wanted = set(only)
-        rows = [r for r in rows if r["station_no"] in wanted]
-        missing = wanted - {r["station_no"] for r in rows}
-        if missing:
-            raise SystemExit(f"Station(s) not in config: {sorted(missing)}")
-    return rows
-
-
-def make_session():
-    """HTTP session that retries transient failures with exponential backoff."""
-    retry = Retry(
-        total=5,
-        backoff_factor=2,  # waits roughly 2, 4, 8, 16 seconds between attempts
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,  # return the last response so raise_for_status reports it
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
-
+# --------------------------------------------------------------------------- API
 
 def fetch_values(session, ts_id, date_from, date_to):
     """Call KiWIS getTimeseriesValues. Returns (request_params, parsed_json)."""
@@ -88,88 +79,161 @@ def fetch_values(session, ts_id, date_from, date_to):
     return params, payload
 
 
+def get_rows(payload):
+    """Return (timestamp_index, value_index, rows) from a getTimeseriesValues response."""
+    block = payload[0]
+    cols = [c.strip() for c in block.get("columns", RETURN_FIELDS).split(",")]
+    return cols.index("Timestamp"), cols.index("Value"), block["data"]
+
+
 def count_records(payload):
-    """Number of value rows in a getTimeseriesValues response, or None if the shape is unexpected."""
+    """(total rows, rows with a value), or (None, None) if the shape is unexpected."""
     try:
-        return len(payload[0]["data"])
-    except (KeyError, IndexError, TypeError):
+        _, vi, rows = get_rows(payload)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None, None
+    return len(rows), sum(1 for r in rows if r[vi] is not None)
+
+
+def to_local_date(ts):
+    """KiWIS timestamp string -> calendar date in Perth."""
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ).date()
+
+
+def latest_valued_date(payload):
+    """Latest local date that has a non-null value, or None."""
+    try:
+        ti, vi, rows = get_rows(payload)
+    except (KeyError, IndexError, TypeError, ValueError):
         return None
+    dates = [to_local_date(r[ti]) for r in rows if r[vi] is not None]
+    return max(dates) if dates else None
 
 
-def build_key(station_no, ingest_date):
+# ------------------------------------------------------------------- watermark
+
+def station_prefix(station_no):
+    return f"bronze/bom/discharge/station={station_no}/"
+
+
+KEY_PATTERN = re.compile(
+    r"ingest_date=(?P<ingest>\d{4}-\d{2}-\d{2})/discharge(?:_(?P<from>[\d-]+)_(?P<to>[\d-]+))?\.json$"
+)
+
+
+def window_end(key):
+    """End date of the window a file covers, from its key. Legacy discharge.json -> its ingest_date."""
+    m = KEY_PATTERN.search(key)
+    if not m:
+        return ""
+    return m.group("to") or m.group("ingest")
+
+
+def find_watermark(station_no, bucket, s3):
+    """Latest day with a value, checking files whose window ends latest first.
+
+    Ordering by window end (not upload time) means a manual backfill of old dates
+    can't drag the watermark backwards.
+    """
+    keys = [k for k, _ in list_objects(station_prefix(station_no), bucket, s3)]
+    keys.sort(key=window_end, reverse=True)
+    for key in keys[:MAX_FILES_TO_SCAN]:
+        found = latest_valued_date(read_json(key, bucket, s3).get("payload"))
+        if found:
+            return found
+    return None
+
+
+def choose_window_start(args, station_no, bucket, state_s3):
+    """Return (date_from, reason)."""
+    if args.date_from:
+        return args.date_from, "manual --from"
+    if args.full_refresh:
+        return DEFAULT_FROM, "full refresh"
+    wm = find_watermark(station_no, bucket, state_s3)
+    if wm is None:
+        return DEFAULT_FROM, "no bronze data yet, first load"
+    start = wm - timedelta(days=LOOKBACK_DAYS)
+    return start.isoformat(), f"watermark {wm.isoformat()} minus {LOOKBACK_DAYS} days"
+
+
+# --------------------------------------------------------------------- output
+
+def build_key(station_no, ingest_date, date_from, date_to):
+    # Window in the file name: a same-day incremental run can't overwrite a full load.
     return (
-        f"bronze/bom/discharge/station={station_no}/"
-        f"ingest_date={ingest_date}/discharge.json"
+        f"{station_prefix(station_no)}ingest_date={ingest_date}/"
+        f"discharge_{date_from}_{date_to}.json"
     )
 
 
-def write_output(body, key, bucket, dry_run, s3):
-    if dry_run:
-        path = LOCAL_OUT / key
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
-        return str(path)
-    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
-    return f"s3://{bucket}/{key}"
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Ingest BoM daily discharge into S3 bronze.")
+    p = argparse.ArgumentParser(description="Ingest BoM daily discharge into S3 bronze (incremental).")
     p.add_argument("--stations", nargs="+", help="Station numbers to run (default: all in config)")
-    p.add_argument("--from", dest="date_from", default=DEFAULT_FROM, help="Start date YYYY-MM-DD")
+    p.add_argument("--from", dest="date_from", default=None, help="Override start date YYYY-MM-DD")
     p.add_argument("--to", dest="date_to", default=date.today().isoformat(), help="End date YYYY-MM-DD")
+    p.add_argument("--full-refresh", action="store_true", help=f"Reload from {DEFAULT_FROM}")
     p.add_argument("--bucket", default=os.environ.get("S3_BUCKET"), help="S3 bucket (or set S3_BUCKET)")
-    p.add_argument("--dry-run", action="store_true", help="Write to ./data instead of S3")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Write to ./data instead of S3 (state is still read from S3 if a bucket is given)")
     return p.parse_args()
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    setup_logging()
     args = parse_args()
     if not args.dry_run and not args.bucket:
         raise SystemExit("No bucket given. Use --bucket or set S3_BUCKET, or run with --dry-run.")
 
     stations = load_stations(CONFIG_PATH, args.stations)
     session = make_session()
-    s3 = None if args.dry_run else boto3.client("s3")
+    state_s3 = boto3.client("s3") if args.bucket else None   # where we read the watermark from
+    write_s3 = None if args.dry_run else state_s3             # where we write the new file
 
     ingested_at = datetime.now(timezone.utc)
     ingest_date = ingested_at.date().isoformat()
 
     log.info(
-        "Starting ingestion: %d station(s), %s to %s, target=%s",
-        len(stations), args.date_from, args.date_to,
-        "local (dry run)" if args.dry_run else f"s3://{args.bucket}",
+        "Starting ingestion: %d station(s), to %s, state=%s, target=%s",
+        len(stations), args.date_to,
+        f"s3://{args.bucket}" if state_s3 else "local",
+        "local (dry run)" if write_s3 is None else f"s3://{args.bucket}",
     )
 
     succeeded, failed = [], []
     for st in stations:
-        station_no = st["station_no"]
+        station_no, name = st["station_no"], st["station_name"]
         try:
-            params, payload = fetch_values(session, st["ts_id"], args.date_from, args.date_to)
-            n = count_records(payload)
+            date_from, reason = choose_window_start(args, station_no, args.bucket, state_s3)
+            params, payload = fetch_values(session, st["ts_id"], date_from, args.date_to)
+            total, valued = count_records(payload)
             envelope = {
                 "source": "bom_kiwis",
                 "station_no": station_no,
-                "station_name": st["station_name"],
+                "station_name": name,
                 "ts_id": st["ts_id"],
                 "ts_name": TS_NAME,
+                "load_type": "full" if date_from == DEFAULT_FROM else "incremental",
+                "window_reason": reason,
                 "request_params": params,
                 "ingested_at": ingested_at.isoformat(),
-                "record_count": n,
+                "record_count": total,
+                "valued_record_count": valued,
                 "payload": payload,  # raw API response, unmodified
             }
             body = json.dumps(envelope).encode("utf-8")
-            target = write_output(body, build_key(station_no, ingest_date), args.bucket, args.dry_run, s3)
-            if not n:
-                log.warning("%s %s: 0 or unreadable records, check the response", station_no, st["station_name"])
-            log.info("%s %s: %s records -> %s", station_no, st["station_name"], n, target)
+            key = build_key(station_no, ingest_date, date_from, args.date_to)
+            target = write_output(body, key, args.bucket, write_s3)
+            if total is None:
+                log.warning("%s %s: unreadable response, check it", station_no, name)
+            log.info("%s %s: %s to %s (%s): %s rows, %s with values -> %s",
+                     station_no, name, date_from, args.date_to, reason, total, valued, target)
             succeeded.append(station_no)
         except Exception as exc:  # keep going so one bad station doesn't stop the run
-            log.error("%s %s: FAILED (%s)", station_no, st["station_name"], exc)
+            log.error("%s %s: FAILED (%s)", station_no, name, exc)
             failed.append(station_no)
 
     log.info("Done: %d succeeded, %d failed %s", len(succeeded), len(failed), failed or "")

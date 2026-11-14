@@ -16,7 +16,7 @@ BoM station numbers match DWER `site_ref` values exactly, so `station_no` is the
 | Milestone | Scope | Status |
 |---|---|---|
 | 1. Ingestion | BoM discharge and DWER metadata into the S3 bronze layer, incremental loads | Done |
-| 2. Warehouse and modelling | Snowflake, dbt staging and marts | Next |
+| 2. Warehouse and modelling | Snowflake, dbt staging and marts | In Progress |
 | 3. Orchestration and data quality | GitHub Actions schedule, dbt tests | Planned |
 | 4. Reporting | Power BI report and write-up | Planned |
 
@@ -74,6 +74,20 @@ python src/ingest_bom.py --bucket <bucket> --full-refresh     # reload from 1975
 python src/ingest_bom.py --bucket <bucket> --from 2020-01-01 --stations 613002   # manual backfill
 python src/ingest_dwer.py --bucket <bucket>
 ```
+
+## Warehouse (Snowflake)
+
+`snowflake/`
+- `aws_iam_setup.sh` read-only IAM policy and role that let Snowflake read the `bronze/` prefix only
+- `01_setup.sql` database, RAW schema, and a 20-credit monthly resource monitor on `COMPUTE_WH` (X-Small, 60-second auto-suspend)
+- `02_integration.sql` storage integration and external stage over the bronze layer
+- `03_raw_load.sql` COPY INTO the RAW tables, plus a row-count check
+
+Run in that order. All SQL scripts are safe to re-run, and COPY INTO skips files it has already loaded.
+
+Access is a two-step handshake: the IAM role is created with a placeholder trust policy, then updated with the IAM user and external ID that Snowflake generates (`DESC INTEGRATION`). Never use `CREATE OR REPLACE` on the integration, as it generates a new external ID and breaks the trust policy.
+
+RAW tables hold one row per bronze file: the JSON document whole in a `VARIANT` column, plus `source_file` and `loaded_at` for lineage. Parsing, deduplication and Perth time conversion happen in dbt staging.
 
 ## Notes
 - Timestamps are returned in UTC (16:00 UTC = 00:00 AWST) and converted to Australia/Perth. The `DailyMean` series is already daily, so no aggregation is needed.

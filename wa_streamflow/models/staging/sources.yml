@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: raw
+    database: WA_STREAMFLOW     # same as in profiles.yml
+    schema: RAW                  # the schema your RAW tables are in
+    tables:
+      - name: raw_bom_discharge
+      - name: raw_dwer_sites  # use your actual DWER table name from SHOW TABLES

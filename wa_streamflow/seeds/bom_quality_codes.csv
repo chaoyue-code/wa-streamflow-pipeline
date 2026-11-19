@@ -1,0 +1,7 @@
+quality_code,quality_grade,quality_description
+10,A,Best available given technologies and techniques at time of classification
+90,B,Compromised in ability to truly represent the parameter
+110,C,Estimate
+140,E,Ability to truly represent the parameter is not known
+210,F,Not of release quality or contains missing data
+-1,Missing,No value returned by the API

@@ -33,9 +33,17 @@ models:
   wa_streamflow:
     staging:
       +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+      +schema: marts
 
 seeds:
   wa_streamflow:
     bom_quality_codes:
       +column_types:
         quality_code: integer
+
+vars:
+  min_completeness_pct: 0.95

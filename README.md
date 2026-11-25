@@ -16,8 +16,8 @@ BoM station numbers match DWER `site_ref` values exactly, so `station_no` is the
 | Milestone | Scope | Status |
 |---|---|---|
 | 1. Ingestion | BoM discharge and DWER metadata into the S3 bronze layer, incremental loads | Done |
-| 2. Warehouse and modelling | Snowflake, dbt staging and marts | In Progress |
-| 3. Orchestration and data quality | GitHub Actions schedule, dbt tests | Planned |
+| 2. Warehouse and modelling | Snowflake, dbt staging, marts and tests (33 passing) | Done |
+| 3. Orchestration and data quality | GitHub Actions schedule, checks for missing days, duplicates and stale data | Planned |
 | 4. Reporting | Power BI report and write-up | Planned |
 
 ## Station selection

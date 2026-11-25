@@ -1,0 +1,13 @@
+version: 2
+
+seeds:
+  - name: bom_quality_codes
+    description: BoM quality codes and grades. Acts as a small dimension for fct_daily_discharge.
+    columns:
+      - name: quality_code
+        data_tests:
+          - unique
+          - not_null
+      - name: quality_grade
+        data_tests:
+          - not_null

@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: int_station_water_year
+    description: One row per station. The calendar month each station's water year starts (BoM HRS rule).
+    columns:
+      - name: station_no
+        data_tests:
+          - unique
+          - not_null
+      - name: water_year_start_month
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 12

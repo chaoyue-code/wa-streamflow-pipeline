@@ -1,0 +1,110 @@
+version: 2
+
+models:
+  - name: fct_daily_discharge
+    description: One row per station per day. Missing days are kept with is_missing = true.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - station_no
+              - reading_date
+    columns:
+      - name: station_no
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_station')
+                field: station_no
+      - name: reading_date
+        data_tests:
+          - not_null
+      - name: quality_code
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [10, 90, 110, 140, 210, -1]
+                quote: false
+          - relationships:
+              arguments:
+                to: ref('bom_quality_codes')
+                field: quality_code
+      - name: is_missing
+        data_tests:
+          - not_null
+      - name: discharge_cumecs
+        description: Daily mean discharge in m3/s.
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+              config:
+                where: "not is_missing"
+
+  - name: dim_station
+    description: One row per BoM station, with DWER metadata left-joined.
+    columns:
+      - name: station_no
+        data_tests:
+          - unique
+          - not_null
+      - name: station_name
+        data_tests:
+          - not_null
+      - name: catchment_area_km2
+        description: Needed for runoff depth. A null here means the DWER join failed.
+        data_tests:
+          - not_null
+      - name: latitude
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: -36
+                max_value: -13
+      - name: longitude
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 112
+                max_value: 130
+      - name: water_year_start_month
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 1
+                max_value: 12
+
+  - name: agg_annual_flow
+    description: One row per station per water year. Filter on is_complete_year for trend analysis.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - station_no
+              - water_year
+    columns:
+      - name: station_no
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_station')
+                field: station_no
+      - name: water_year
+        data_tests:
+          - not_null
+      - name: completeness_pct
+        data_tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: is_complete_year
+        data_tests:
+          - not_null
